@@ -1530,10 +1530,8 @@ gp_update_ao_master_stats(PG_FUNCTION_ARGS)
 
 typedef struct
 {
-	uint64 index;
-	/* there is a chance the count will return more than 2^32 rows
-	 * plus SPI_processed is 64 bit anyway */
-	uint64 rows;
+	int			index;
+	int			rows;
 } QueryInfo;
 
 

@@ -1191,33 +1191,6 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	}
 	PG_END_TRY();
 
-
-#ifdef FAULT_INJECTOR
-	/*
-	 * Allow testing of very high number of processed rows, without spending
-	 * hours actually processing that many rows.
-	 *
-	 * Somewhat arbitrarily, only trigger this if more than 10000 rows were truly
-	 * processed. This screens out some internal queries that the system might
-	 * issue during planning.
-	 */
-	if (estate->es_processed >= 10000 && estate->es_processed <= 1000000)
-	//if (estate->es_processed >= 10000)
-	{
-		if (FaultInjector_InjectFaultIfSet("executor_run_high_processed",
-										   DDLNotSpecified,
-										   "" /* databaseName */,
-										   "" /* tableName */) == FaultInjectorTypeSkip)
-		{
-			/*
-			 * For testing purposes, pretend that we have already processed
-			 * almost 2^32 rows.
-			 */
-			estate->es_processed = UINT_MAX - 10;
-		}
-	}
-#endif /* FAULT_INJECTOR */
-
 	/*
 	 * shutdown tuple receiver, if we started it
 	 */
@@ -3248,27 +3221,6 @@ ExecutePlan(EState *estate,
 		if (operation == CMD_SELECT)
 		{
 			(estate->es_processed)++;
-
-#ifdef FAULT_INJECTOR
-			/*
-			 * bump es_processed using the fault injector, but only if the number rows is in a certain range
-			 * this avoids bumping the counter every time after we bumped it once
-			 */
-			if (estate->es_processed >= 10000 && estate->es_processed <= 1000000)
-			{
-				if (FaultInjector_InjectFaultIfSet("executor_run_high_processed",
-												   DDLNotSpecified,
-												   "" /* databaseName */,
-												   "" /* tableName */) == FaultInjectorTypeSkip)
-				{
-					/*
-					 * For testing purposes, pretend that we have already processed
-					 * almost 2^32 rows.
-					 */
-					estate->es_processed = UINT_MAX - 10;
-				}
-			}
-#endif /* FAULT_INJECTOR */
 		}
 
 		/*

@@ -35,7 +35,6 @@
 #include "utils/typcache.h"
 #include "utils/resource_manager.h"
 #include "utils/resscheduler.h"
-#include "utils/faultinjector.h"
 #include "utils/metrics_utils.h"
 
 #include "cdb/cdbvars.h"
@@ -53,7 +52,18 @@
  * interference between different SPI callers, we save and restore them
  * when entering/exiting a SPI nesting level.
  */
-uint64		SPI_processed = 0;
+/*
+ * Update the legacy 32-bit processed counter, but handle overflow.
+ */
+#define SET_SPI_PROCESSED	\
+		if (SPI_processed64 > UINT_MAX) \
+			SPI_processed = UINT_MAX; \
+		else \
+			SPI_processed = (uint32)SPI_processed64
+
+
+uint64		SPI_processed64 = 0;
+uint32		SPI_processed = 0;
 Oid			SPI_lastoid = InvalidOid;
 SPITupleTable *SPI_tuptable = NULL;
 int			SPI_result = 0;
@@ -73,19 +83,19 @@ static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan);
 
 static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
-				  bool read_only, bool fire_triggers, int64 tcount);
+				  bool read_only, bool fire_triggers, long tcount);
 
 static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes,
 					Datum *Values, const char *Nulls);
 
 static void _SPI_assign_query_mem(QueryDesc *queryDesc);
 
-static int	_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, int64 tcount);
+static int	_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount);
 
 static void _SPI_error_callback(void *arg);
 
 static void _SPI_cursor_operation(Portal portal,
-					  FetchDirection direction, int64 count,
+					  FetchDirection direction, long count,
 					  DestReceiver *dest);
 
 static SPIPlanPtr _SPI_make_plan_non_temp(SPIPlanPtr plan);
@@ -181,6 +191,7 @@ SPI_connect(void)
 	 * Reset API global variables so that current caller cannot accidentally
 	 * depend on state of an outer caller.
 	 */
+	SPI_processed64 = 0;
 	SPI_processed = 0;
 	SPI_lastoid = InvalidOid;
 	SPI_tuptable = NULL;
@@ -258,6 +269,7 @@ AtEOXact_SPI(bool isCommit)
 	_SPI_stack_depth = 0;
 	_SPI_connected = _SPI_curid = -1;
 	/* Reset API global variables, too */
+	SPI_processed64 = 0;
 	SPI_processed = 0;
 	SPI_lastoid = InvalidOid;
 	SPI_tuptable = NULL;
@@ -303,6 +315,7 @@ AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid)
 		 * SPI_finish(), we don't risk switching to memory contexts that might
 		 * be already gone.
 		 */
+		SPI_processed64 = connection->outer_processed;
 		SPI_processed = connection->outer_processed;
 		SPI_lastoid = connection->outer_lastoid;
 		SPI_tuptable = connection->outer_tuptable;
@@ -415,7 +428,7 @@ SPI_restore_connection(void)
 
 /* Parse, plan, and execute a query string */
 int
-SPI_execute(const char *src, bool read_only, int64 tcount)
+SPI_execute(const char *src, bool read_only, long tcount)
 {
 	_SPI_plan	plan;
 	int			res;
@@ -443,7 +456,7 @@ SPI_execute(const char *src, bool read_only, int64 tcount)
 
 /* Obsolete version of SPI_execute */
 int
-SPI_exec(const char *src, int64 tcount)
+SPI_exec(const char *src, long tcount)
 {
 	return SPI_execute(src, false, tcount);
 }
@@ -451,7 +464,7 @@ SPI_exec(const char *src, int64 tcount)
 /* Execute a previously prepared plan */
 int
 SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
-				 bool read_only, int64 tcount)
+				 bool read_only, long tcount)
 {
 	int			res;
 
@@ -477,7 +490,7 @@ SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
 
 /* Obsolete version of SPI_execute_plan */
 int
-SPI_execp(SPIPlanPtr plan, Datum *Values, const char *Nulls, int64 tcount)
+SPI_execp(SPIPlanPtr plan, Datum *Values, const char *Nulls, long tcount)
 {
 	return SPI_execute_plan(plan, Values, Nulls, false, tcount);
 }
@@ -521,7 +534,7 @@ int
 SPI_execute_snapshot(SPIPlanPtr plan,
 					 Datum *Values, const char *Nulls,
 					 Snapshot snapshot, Snapshot crosscheck_snapshot,
-					 bool read_only, bool fire_triggers, int64 tcount)
+					 bool read_only, bool fire_triggers, long tcount)
 {
 	int			res;
 
@@ -555,7 +568,7 @@ int
 SPI_execute_with_args(const char *src,
 					  int nargs, Oid *argtypes,
 					  Datum *Values, const char *Nulls,
-					  bool read_only, int64 tcount)
+					  bool read_only, long tcount)
 {
 	int			res;
 	_SPI_plan	plan;
@@ -1289,6 +1302,7 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 		elog(ERROR, "SPI_cursor_open called while not connected");
 
 	/* Reset SPI result (note we deliberately don't touch lastoid) */
+	SPI_processed64 = 0;
 	SPI_processed = 0;
 	SPI_tuptable = NULL;
 	_SPI_current->processed = 0;
@@ -1494,7 +1508,7 @@ void
 SPI_cursor_fetch(Portal portal, bool forward, long count)
 {
 	_SPI_cursor_operation(portal,
-						  forward ? FETCH_FORWARD : FETCH_BACKWARD, (int64) count,
+						  forward ? FETCH_FORWARD : FETCH_BACKWARD, count,
 						  CreateDestReceiver(DestSPI));
 	/* we know that the DestSPI receiver doesn't need a destroy call */
 }
@@ -1509,7 +1523,7 @@ void
 SPI_cursor_move(Portal portal, bool forward, long count)
 {
 	_SPI_cursor_operation(portal,
-						  forward ? FETCH_FORWARD : FETCH_BACKWARD, (int64) count,
+						  forward ? FETCH_FORWARD : FETCH_BACKWARD, count,
 						  None_Receiver);
 }
 
@@ -1523,7 +1537,7 @@ void
 SPI_scroll_cursor_fetch(Portal portal, FetchDirection direction, long count)
 {
 	_SPI_cursor_operation(portal,
-						  direction, (int64) count,
+						  direction, count,
 						  CreateDestReceiver(DestSPI));
 	/* we know that the DestSPI receiver doesn't need a destroy call */
 }
@@ -1537,7 +1551,7 @@ SPI_scroll_cursor_fetch(Portal portal, FetchDirection direction, long count)
 void
 SPI_scroll_cursor_move(Portal portal, FetchDirection direction, long count)
 {
-	_SPI_cursor_operation(portal, direction, (int64) count, None_Receiver);
+	_SPI_cursor_operation(portal, direction, count, None_Receiver);
 }
 
 
@@ -2082,7 +2096,7 @@ _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
 static int
 _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
-				  bool read_only, bool fire_triggers, int64 tcount)
+				  bool read_only, bool fire_triggers, long tcount)
 {
 	int			my_res = 0;
 	uint64		my_processed = 0;
@@ -2432,7 +2446,8 @@ fail:
 	error_context_stack = spierrcontext.previous;
 
 	/* Save results for caller */
-	SPI_processed = my_processed;
+	SPI_processed64 = my_processed;
+	SET_SPI_PROCESSED;
 
 	SPI_lastoid = my_lastoid;
 	SPI_tuptable = my_tuptable;
@@ -2522,7 +2537,7 @@ _SPI_assign_query_mem(QueryDesc * queryDesc)
 }
 
 static int
-_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, int64 tcount)
+_SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount)
 {
 	int			operation = queryDesc->operation;
 	int			eflags;
@@ -2662,21 +2677,8 @@ _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, int64 tcount)
 		_SPI_current->lastoid = queryDesc->es_lastoid;
 		if (checkTuples)
 		{
-#ifdef FAULT_INJECTOR
-			/*
-			 * only check number tuples if the SPI 64 bit test is NOT running
-			 */
-			if (!FaultInjector_InjectFaultIfSet("executor_run_high_processed",
-										   DDLNotSpecified,
-										   "" /* databaseName */,
-										   "" /* tableName */))
-			{
-#endif /* FAULT_INJECTOR */
-				if (_SPI_checktuples())
-					elog(ERROR, "consistency check on SPI tuple count failed");
-#ifdef FAULT_INJECTOR
-			}
-#endif /* FAULT_INJECTOR */
+			if (_SPI_checktuples())
+				insist_log(false, "consistency check on SPI tuple count failed");
 		}
 
 		gp_enable_gpperfmon = orig_gp_enable_gpperfmon;
@@ -2740,10 +2742,10 @@ _SPI_error_callback(void *arg)
  *	Do a FETCH or MOVE in a cursor
  */
 static void
-_SPI_cursor_operation(Portal portal, FetchDirection direction, int64 count,
+_SPI_cursor_operation(Portal portal, FetchDirection direction, long count,
 					  DestReceiver *dest)
 {
-	uint64		nfetched;
+	int64		nfetched;
 
 	/* Check that the portal is valid */
 	if (!PortalIsValid(portal))
@@ -2754,6 +2756,7 @@ _SPI_cursor_operation(Portal portal, FetchDirection direction, int64 count,
 		elog(ERROR, "SPI cursor operation called while not connected");
 
 	/* Reset the SPI result (note we deliberately don't touch lastoid) */
+	SPI_processed64 = 0;
 	SPI_processed = 0;
 	SPI_tuptable = NULL;
 	_SPI_current->processed = 0;
@@ -2779,7 +2782,8 @@ _SPI_cursor_operation(Portal portal, FetchDirection direction, int64 count,
 		elog(ERROR, "consistency check on SPI tuple count failed");
 
 	/* Put the result into place for access by caller */
-	SPI_processed = _SPI_current->processed;
+	SPI_processed64 = _SPI_current->processed;
+	SET_SPI_PROCESSED;
 
 	SPI_tuptable = _SPI_current->tuptable;
 
@@ -2861,7 +2865,7 @@ _SPI_end_call(bool use_exec)
 static bool
 _SPI_checktuples(void)
 {
-	uint64		processed = _SPI_current->processed;
+	uint32		processed = _SPI_current->processed;
 	SPITupleTable *tuptable = _SPI_current->tuptable;
 	bool		failed = false;
 

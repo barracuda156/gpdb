@@ -2249,7 +2249,6 @@ acquire_hll_by_query(Relation onerel, int nattrs, VacAttrStats **attrstats, int 
 	 * targrows in analyze_rel_internal() is an int,
 	 * it's unlikely that this query will return more rows
 	 */
-	Assert(SPI_processed < 2);
 	int sampleTuples = (int) SPI_processed;
 
 	/* Ok, read in the tuples to *rows */
